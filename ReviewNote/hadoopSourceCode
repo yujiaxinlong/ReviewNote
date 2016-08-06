@@ -1,0 +1,97 @@
+org.apache.hadoop.io
+序列化接口Writable
+ComparableWritable<T> 是Writable的子类
+常用的Text, IntWritable,FloatWritable等都implements ComparableWritable
+write()与readFields()函数负责将对象序列/反序列化, write是将对象的内容写入DataOutput类型的参数中,而readFields()是从DataInput类型的参数中读取内容.
+
+使用泛型与反射结合的方法来实现工厂方法模式,可以用来创建Writable对象, WritableFactories类维护了一个<Class,Factory>的静态Map Class_to_Factory,一些Writable类有静态模块调用 WritableFactories 的setFactory()方法向Map中添加Factory.
+
+WritableFactories的newInstance()方法以 Class 作为参数从Map中取Class对应的工厂,创建 Class的对象,如果Class不在Map中,则调用ReflecionUtils的newInstance()方法.
+
+ArrayWritable类的readFields()方法调用了WritableFactories的newInstance()方法,创建不明类型的Writable对象.
+
+org.apache.hadoop.io.serializer
+
+使用泛型实现抽象工厂模式,创建serializer和deserializer.
+WritableSerializa类中有两个内部类WritableSerializer 与WritableDeserializer, 它们的serialize()方法与deserialize()方法分别调用write()与readFields.
+
+io.retry.RetryInvocationHandler
+
+是ipc包中InvocationHandler类的子类,用来实现进程间通信的retry,内含proxyProvider, 在hdfs中,与ipc包中的invoker一起使用,实现双重代理. 其invoke()方法对是否retry的条件进行判定, 通过调用provider的performFailover()方法进行retry
+
+org.apache.hadoop.ipc
+
+Client
+Client类用一个><ConnectionId,Connection>的Hashtable来维护一个client的多个connection.
+Call是Client的一个内部类,有int id, Writable rpcRequest, Writable rpcResponse, RPC.RpcKind rpcKind等属性, 其中除了rpcResponse以外都是final的.
+
+Connection也是Client的内部类,它是Thread的子类,RPC调用(即Call)是通过Connection来完成的, Connection 维护 Hashtable<Integer, Call> calls来存储本连接的所有calls, Connection有一个私有的synchronized方法addCall()用来向calls中添加call并同时notify().   Client只在getConnection()方法中调用了addCall(). getConnection通过connectionId来返回Connection,如果Connection不存在则新建一个. 在getConnection()的最后,这个Connection调用setupIOstreams()方法连接至服务器并且建立iostream,同时发送一个header并start()这个线程等待回应
+
+Connection的run()方法调用synchronized 方法waitForWork(), 在waitForWork()中如果calls为空,Connection会根据timeout值首先wait() for addcall()调用notify(). 如果call不为空, 则返回true,开始receiveRpcResponse().WaitForWork()的行为同时还受Connection的shouldCloseConnection,与Client的running两个AtomicBoolean类型的属性影响.
+
+Connection有sendRpcRequest()和ReceiveRpcResponse()两个私有方法,分别用来发送request和接收response. 这两个方法分别对Request/Response进行序列化/反序列化处理. header的序列化是由protobuf完成的,值的序列化则由Writable对象的readFields与write方法完成.
+
+Client的运行流程大致为
+Client.calls中创建Call,调用getConnection获取connection, 如果connection不在Client的connections table中, 则新建一个. 接着调用connection.addcall将新创建的Call加入connection的calls Table, addCall会notify Connection 线程,但是新建的Connection并没有在等待. 接着调用Connection.setIOstreams 分配Socket连接服务器,建立iostream, 发送header, 并调用connection.start, 启动Connection线程. setIOstream方法会在Connection已拥有Socket的情况下直接返回. Connection线程启动后, waitForWork方法会在calls Table为空时等待 addCall方法的唤醒. 唤醒后返回true,调用receiveRpcResponse()方法准备接收回应. 
+
+在Connection线程运行的同时,Client.calls继续运行,调用connection.sendRpcRequest并因为calls.wait进入等待.  Connection线程的receiveRpcResponse()方法接收到response并处理后, 调用callComplete notify Client,返回call.getResponse
+
+RPC Engine
+Hadoop RPC有两个引擎:
+ProtobufRpcEngine是当前hadoop主要使用的Engine
+WritableRpcEngine是从前使用的
+
+RPC的实现使用了java的动态代理技术. 流程大致为,客户端调用RPC.getProxy(),RPC.getProxy()调用引擎中的getProxy()方法,用Proxy.newProxyInstance()创建代理并返回, 接着在调用protocol的方法时,会自动转为调用服务器端两个引擎中invoker内部类的invoke方法,使用哪个引擎由RPC中维护的PROTOCOL_ENGINES Map决定,如果不存在则由conf决定.  invoker是InvocationHandler的子类. 在将invoker实例化时会从引擎的ClientCache中获取一个Client. invoke方法的主要内容是将proxy及其调用的方法包装为rpcRequest,发送,并接收response.
+
+VersionedProtocol是所有使用了hadoop rpc的协议的父类
+
+Server是一个抽象类,call是其中唯一的一个抽象方法,意味着Server 的具体功能,需要具体类来完成. RPC.Server与两个RpcEngine中的Server都是这个Server的子类.
+Server.Call与Client.Call非常相似,最大的不同点在于Server.Call实现了Schedulable接口,以及保存有ConnectionId. 这个Schedulable接口是hadoop自己定义的,作用是返回UserGroupInformation,这个信息可以被用来创建chedulable identity strings.
+Server.Connection 维护了一个来自客户端的 socket 连接。它处理版本校验,读取请求并把请求发送给请求处理线程,接收处理结果并把结果収送给客户端
+此外Server中还有Listener,Handler,Responder等几个继承了Threads的内部类用来处理call. 在处理call的过程中Connection会将call反序列化.
+RPC.Server是Server的子类,它声明为一个抽象类但是其中并没有抽象方法.它的构造函数加载时会同时加载Server的构造函数,并调用initProtocolMetaInfo(conf).这个函数负责将ProtocolInfoService的协议在服务器注册. Server的addProtocol方法负责向Server中添加协议.
+Rpc.Server重写了Server的call方法,但只是简单的根据rpcKind参数获取一个RpcInvoker并调用它的call方法. RpcInvoker是定义在RPC.Server中的一个接口,两个引擎中分别实现了它. 它只有call一个方法,用来处理来自Client的call.
+RPC.Server的构造函数不需要提供protocolImpl对象.
+两个引擎分别有一个继承了RPC.Server的内部类,两个类都只有构造函数(Writable引擎中还有一个log),这两个构造函数都会调用父类的构造函数,并向服务器中注册不同的协议.
+
+对来自Client的call的处理由两个引擎的RpcInvoker内部类的call方法完成,Protobuf引擎返回一个新的RpcWrapper(继承自Writable)类型的response,而Writable引擎返回ObjectWritable. 在Server的Connection运行时,就已经对call.rpcRequest反序列化了,protobuf的反序列化依靠protobufRpcEngine中的RpcRequestWrapper类,writable的反序列化依靠WritableEngine中的invocation类. RpcRequestWrapper的反序列化实质上是提取request的header,这个header属于protobuf的GeneratedMessage类的一个子类. Invocation类的反序列化则是将相对应的属性一一读取. 
+
+要注意的是每次服务器接收到的信息除了rpcRequest之外还有一个header,这个header是RpcRequestHeaderProto类的,里面存有callid,retry,rpcKind等信息.这也是一个由protobuf生成的类,也就是说即使是使用writable引擎同样要使用protobuf
+
+
+Hadoop.hdfs.protocol
+HDFS对RPC的使用采用了双重代理. 在retryinvocationHandler内还有一个proxyProvider,用来提供RPC.invoker. 目的是HA的retry功能.
+
+hdfs protocol 及相关包的命名比较复杂,主要包括以下几个系列
+1*****
+ClientProtocol---protocol.ClientNamenodeProtocolTranslatorPB
+
+ClientNamenodeProtocolPB---ClientNamenodeProtocolServerSideTranslatorPB
+
+这是Client用来和Namenode通信的协议,ClientNamenodeProtocolTranslatorPB实现的主要作用是将客户端的RPC调用转化为protobuf类型,它含有一个ClientNamenodeProtocolPB类的属性, 这个接口继承了由protobuf生成的接口以添加维护安全性所需的标记.所有调用translator的方法都会被转化为对ClientNamenodeProtocolPB类对应方法的调用. ClientNamenodeProtocolServerSideTranslatorPB 实现了这个类, 它含有一个ClientProtocol类的属性server,实现的方法都是将protobuf类型的request中包含的数据作为参数,调用server的相应方法,在这里server应该是继承了ClientProtocol的NameNodeRpcServer类.
+
+2******
+ClientDatanodeProtocol---ClientDatanodeProtocolTranslatorPB
+
+DatanodeProtocol---DatanodeProtocolClientSideTranslatorPB
+
+ClientDatanodeProtocolPB---ClientDatanodeProtocolServerSideTranslatorPB
+
+DatanodeProtocolPB---DatanodeProtocolServerSideTranslatorPB
+
+同1相似,ClientDatanodeProtocol定义client与datanode的通信,DatanodeProtocol定义了Datanode与Namenode通信的方法
+
+3*******
+NamenodeProtocol---NamenodeProtocolTranslatorPB
+
+NamenodeProtocolPB---NamenodeProtocolServerSideTranslatorPB
+
+与1,2相似,定义Secondary Namenode与Namenode之间的通信
+
+
+
+hdfs.namenode datanode fsnamesystem
+
+
+NamenodeProtocols继承了大量接口,包含所有对Namenode调用的方法.NamenodeRpcServer实现了这个类.
+
